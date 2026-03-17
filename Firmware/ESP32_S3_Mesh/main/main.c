@@ -18,8 +18,14 @@
 #include "esp_netif.h"
 #include "esp_sntp.h"
 #include "lwip/inet.h"
-
-
+#include "tinyusb.h"
+#include "class/hid/hid_device.h" 
+#include "tusb.h"
+#include "tusb_console.h"
+#include "soc/rtc_cntl_reg.h" // 引入底层 RTC 寄存器控制
+#include "esp_system.h"
+#include "soc/usb_serial_jtag_reg.h"
+#include "ble_client.h"
 
 // 必须引入 LVGL 核心头文件
 #include "lvgl.h" 
@@ -29,7 +35,6 @@ static const char *TAG = "LCD_TEST";
 // 加上 volatile 防止被编译器优化，专门给后台任务和 UI 桥接用
 volatile bool g_wifi_connected = false;
 volatile bool g_is_provisioning = false; // 【新增】标记是否正在配网
-
 
 #define PIN_NUM_MOSI   11  
 #define PIN_NUM_CLK    12  
@@ -46,6 +51,11 @@ volatile bool g_is_provisioning = false; // 【新增】标记是否正在配网
 // 注意：我们将物理分辨率定义放这里，但在 LVGL 中我们要把它“横过来”
 #define TEST_LCD_PHYS_H_RES 172
 #define TEST_LCD_PHYS_V_RES 320
+
+// 标准键盘的 HID 报告描述符
+static const uint8_t hid_report_descriptor[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
+};
 
 // =========================================================
 // Wi-Fi 与配网 (SmartConfig) 事件回调
@@ -206,29 +216,175 @@ static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     int offsety1 = area->y1;
     int offsety2 = area->y2;
 
-    // 计算当前要刷新的像素总数
-    uint32_t size = (offsetx2 - offsetx1 + 1) * (offsety2 - offsety1 + 1);
+    // // 计算当前要刷新的像素总数
+    // uint32_t size = (offsetx2 - offsetx1 + 1) * (offsety2 - offsety1 + 1);
     
-    // 【核心修复：高低字节互换】
-    // 将 8位的指针强转为 16位，然后挨个把像素的高低 8 位对调！
-    uint16_t *buf16 = (uint16_t *)px_map;
-    for(uint32_t i = 0; i < size; i++) {
-        buf16[i] = (buf16[i] >> 8) | (buf16[i] << 8);
-    }
+    // // 【核心修复：高低字节互换】
+    // // 将 8位的指针强转为 16位，然后挨个把像素的高低 8 位对调！
+    // uint16_t *buf16 = (uint16_t *)px_map;
+    // for(uint32_t i = 0; i < size; i++) {
+    //     buf16[i] = (buf16[i] >> 8) | (buf16[i] << 8);
+    // }
     
     // 通过 SPI 驱动把这块区域的像素推送到屏幕
     esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
 }
 
+// ==========================================
+// TinyUSB HID 必须实现的核心回调函数
+// ==========================================
+
+// 1. 当电脑请求获取 HID 报告描述符时，触发此回调
+uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    // 把我们前面定义的键盘描述符交还给电脑
+    return hid_report_descriptor;
+}
+
+// 2. 当电脑发起 GET_REPORT 请求时触发（本项目暂不需要用到，返回 0 即可）
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen)
+{
+    return 0; 
+}
+
+// 3. 当电脑发起 SET_REPORT 请求时触发（例如按下电脑键盘的 CapsLock 键，电脑发信号让小键盘亮灯，本项目暂不处理）
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize)
+{
+    // 置空即可
+}
+
+// ==========================================
+// 终极形态：纯净版 HID 键盘描述符 (剔除 CDC)
+// ==========================================
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+
+enum {
+    ITF_NUM_HID = 0,
+    ITF_NUM_TOTAL
+};
+
+#define EPNUM_HID_IN 0x81 
+
+static const tusb_desc_device_t desc_device = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = 0x00,    // 0x00 表示类定义在 Interface 层
+    .bDeviceSubClass = 0x00,
+    .bDeviceProtocol = 0x00,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = 0x303A,  
+    .idProduct = 0x4002,     // 改个 PID 防止电脑缓存旧配置
+    .bcdDevice = 0x0100,
+    .iManufacturer = 0x01,
+    .iProduct = 0x02,
+    .iSerialNumber = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+static const uint8_t desc_configuration[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(hid_report_descriptor), EPNUM_HID_IN, 16, 10)
+};
+
+static const char* string_desc_arr[] = {
+    (const char[]) { 0x09, 0x04 }, 
+    "Espressif",                   
+    "S3 GRUB Assistor",            
+    "114514",                      
+};
+
+void reboot_to_flash_mode(void) {
+   ESP_LOGI(TAG, "Forcing D+ LOW to simulate unplug, then reboot to ROM...");
+   REG_WRITE(RTC_CNTL_OPTION1_REG, 1);
+   esp_restart();
+}
+
+static void reisub_macro_task(void *arg) {
+    if (!tud_hid_ready()) {
+        ESP_LOGW(TAG, "HID not ready, cannot send macro!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Initiating Magic SysRq REISUB sequence...");
+
+    uint8_t keycode[6] = {0};
+    uint8_t modifier = KEYBOARD_MODIFIER_LEFTALT; // 保持按下 Left Alt
+
+    // SysRq 在标准 USB HID 协议中对应的是 Print Screen 键 (0x46)
+    keycode[0] = HID_KEY_PRINT_SCREEN; 
+
+    // 1. 发送 Alt + SysRq 的初始按下状态，让内核准备接客
+    tud_hid_keyboard_report(0, modifier, keycode);
+    vTaskDelay(pdMS_TO_TICKS(500)); 
+
+    // 2. 依次按下 R, E, I, S, U, B
+    uint8_t seq[] = {HID_KEY_R, HID_KEY_E, HID_KEY_I, HID_KEY_S, HID_KEY_U, HID_KEY_B};
+    
+    for(int i = 0; i < 6; i++) {
+        // 按下字母键 (同时保持 Alt+SysRq 按下)
+        keycode[1] = seq[i];
+        tud_hid_keyboard_report(0, modifier, keycode);
+        vTaskDelay(pdMS_TO_TICKS(200)); // 模拟人手按压的持续时间
+
+        // 松开字母键 (但保持 Alt+SysRq 按下)
+        keycode[1] = 0; 
+        tud_hid_keyboard_report(0, modifier, keycode);
+        
+        // 【灵魂细节】：进程结束和硬盘同步需要时间！
+        if (seq[i] == HID_KEY_S) {
+            // Sync 阶段必须多等一会儿，给硬盘写入缓存的时间，保护数据
+            vTaskDelay(pdMS_TO_TICKS(1500)); 
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(400));
+        }
+    }
+
+    // 3. 宏发送完毕，释放所有按键
+    tud_hid_keyboard_report(0, 0, NULL);
+    ESP_LOGI(TAG, "REISUB macro complete. System should reboot now.");
+    
+    // 销毁当前任务
+    vTaskDelete(NULL);
+}
+
+// 暴露给 LVGL 按钮调用的触发函数
+void trigger_linux_reisub(void) {
+    // 创建一个独立任务来跑这个宏，绝对不卡死 UI！
+    xTaskCreate(reisub_macro_task, "reisub_task", 2048, NULL, 5, NULL);
+}
+
 void app_main(void)
 {
+
     // 1. 初始化 NVS 闪存 (必须，用于存储 Wi-Fi 账密)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
       ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(ret); 
+
+   // ==========================================
+    // 2. 初始化 TinyUSB (CDC + HID 复合设备)
+    // ==========================================
+    ESP_LOGI(TAG, "USB initialization");
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = &desc_device,
+        .string_descriptor = string_desc_arr,
+        .string_descriptor_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]),
+        .external_phy = false,
+        .configuration_descriptor = desc_configuration,
+    };
+    
+    esp_err_t usb_err = tinyusb_driver_install(&tusb_cfg);
+    if(usb_err != ESP_OK) {
+        ESP_LOGE(TAG, "TinyUSB Init Failed! Error code: %d", usb_err);
+    } else {
+        ESP_LOGI(TAG, "TinyUSB Init SUCCESS!");
+    }
+    // ==========================================
 
     // 2. 初始化网络接口和事件循环
     ESP_ERROR_CHECK(esp_netif_init());
@@ -277,8 +433,7 @@ void app_main(void)
         .miso_io_num = -1, 
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        // 这里把传输上限加大，以支持横屏的缓冲大小
-        .max_transfer_sz = 320 * 40 * sizeof(uint16_t), 
+        .max_transfer_sz = 320 * 172 * sizeof(uint16_t), 
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
@@ -307,15 +462,15 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     
-    esp_lcd_panel_invert_color(panel_handle, true);
-    esp_lcd_panel_set_gap(panel_handle, 34, 0); 
+   esp_lcd_panel_invert_color(panel_handle, true);
 
-    // 【极其关键的一步】：强制屏幕变为横屏模式 (Landscape)！
-    // 如果画面颠倒了，把 false, true 改成 true, false 试试
+    // 1. 让底层硬件自己处理横屏矩阵！
     esp_lcd_panel_swap_xy(panel_handle, true); 
+    
+    // 2. 硬件镜像微调（如果字是反的，改这里为 true, false 或者 false, false）
     esp_lcd_panel_mirror(panel_handle, false, true); 
 
-    // 【关键修改 2】：横屏后，34 像素的物理黑边偏移量必须转移到 Y 轴！
+    // 3. 硬件横屏下的黑边补偿（必须转移到 Y 轴！）
     esp_lcd_panel_set_gap(panel_handle, 0, 34);
 
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
@@ -326,27 +481,28 @@ void app_main(void)
     // 1. 初始化 LVGL 引擎
     lv_init(); 
 
-    // 2. 创建 LVGL 显示驱动 (注意这里写的是横屏尺寸 320x172)
     lv_display_t * disp = lv_display_create(320, 172);
-
-    // 1. 直接拉满，一次性刷入 172 行 (全屏)
-    #define LINES_PER_FLUSH 172
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    
+    // 【核心战略转移】：使用 1/2 屏幕 (86行)
+    // 大约占用 55KB 内存。因为 LVGL 不抢地盘了，内部 SRAM 绝对装得下！
+    #define LINES_PER_FLUSH 86  
     size_t buffer_size = 320 * LINES_PER_FLUSH * sizeof(uint16_t);
     
-    // 2. 只分配一个 buf1，强制使用内部高速 SRAM
+    // 【终极魔法】：彻底抛弃 PSRAM，使用 MALLOC_CAP_INTERNAL！
     uint16_t *buf1 = heap_caps_malloc(buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     
     if (buf1 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate 110KB internal DMA memory! (RAM fragmentation)");
+        ESP_LOGE(TAG, "FATAL: Failed to allocate 55KB internal DMA memory!");
         return;
     }
+    ESP_LOGI(TAG, "SUCCESS: Allocated 55KB Buffer in INTERNAL SRAM!");
 
-    // 3. 将回调、缓存绑定到 LVGL (注意：buf2 填 NULL)
     lv_display_set_flush_cb(disp, my_disp_flush);
-    // 这里依然使用 PARTIAL 模式，但因为 buffer 已经和屏幕一样大了，它实际上会一波流发完
+
+    // 【必须】改回 PARTIAL 局部刷新模式
     lv_display_set_buffers(disp, buf1, NULL, buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_user_data(disp, panel_handle);
-
     // 5. 注册 DMA 完成硬件中断回调给 LVGL
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = notify_lvgl_flush_ready,
@@ -375,6 +531,11 @@ void app_main(void)
     lv_indev_t * indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_ENCODER);
     lv_indev_set_read_cb(indev, encoder_read_cb);
+
+    // =======================================
+    // 新增：把蓝牙初始化挪到这里！等显存申请完再启动蓝牙！
+    // =======================================
+    ble_client_init();
 
     // =======================================
     // 召唤 UI

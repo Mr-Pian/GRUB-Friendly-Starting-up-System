@@ -1,1 +1,10 @@
-idf_component_register(SRCS "LVGL_UI.c" "Icons/computer.c" "Icons/connection.c" "Icons/linux_button.c" "Icons/power_button.c" "Icons/settings.c"  "Fonts/ka1.c" INCLUDE_DIRS "." REQUIRES lvgl esp_timer)
+idf_component_register(SRCS "LVGL_UI.c" 
+                            "Icons/computer.c" 
+                            "Icons/connection.c" 
+                            "Icons/linux_button.c" 
+                            "Icons/power_button.c" 
+                            "Icons/settings.c"  
+                            "Fonts/ka1.c" 
+                            "ble_client.c" 
+                       INCLUDE_DIRS "." 
+                       REQUIRES lvgl esp_timer bt nvs_flash log)
