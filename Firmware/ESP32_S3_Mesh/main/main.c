@@ -26,6 +26,9 @@
 #include "esp_system.h"
 #include "soc/usb_serial_jtag_reg.h"
 #include "ble_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_pm.h"
 
 // 必须引入 LVGL 核心头文件
 #include "lvgl.h" 
@@ -300,7 +303,23 @@ void reboot_to_flash_mode(void) {
    esp_restart();
 }
 
+// ==========================================
+// 【防卡键神药】：绝对安全的 HID 报告发送器
+// ==========================================
+static void safe_hid_report(uint8_t modifier, uint8_t keycode[]) {
+    // 每次发送前，最多等 50 毫秒看 USB 线路是否空闲
+    for (int i = 0; i < 5; i++) {
+        if (tud_hid_ready()) {
+            tud_hid_keyboard_report(0, modifier, keycode);
+            return; // 发送成功立刻退出
+        }
+        vTaskDelay(pdMS_TO_TICKS(10)); // 线路忙，等 10ms 再试
+    }
+    ESP_LOGW(TAG, "HID Endpoint busy, packet dropped!");
+}
+
 static void reisub_macro_task(void *arg) {
+
     if (!tud_hid_ready()) {
         ESP_LOGW(TAG, "HID not ready, cannot send macro!");
         vTaskDelete(NULL);
@@ -316,7 +335,7 @@ static void reisub_macro_task(void *arg) {
     keycode[0] = HID_KEY_PRINT_SCREEN; 
 
     // 1. 发送 Alt + SysRq 的初始按下状态，让内核准备接客
-    tud_hid_keyboard_report(0, modifier, keycode);
+    safe_hid_report(modifier, keycode);
     vTaskDelay(pdMS_TO_TICKS(500)); 
 
     // 2. 依次按下 R, E, I, S, U, B
@@ -325,12 +344,12 @@ static void reisub_macro_task(void *arg) {
     for(int i = 0; i < 6; i++) {
         // 按下字母键 (同时保持 Alt+SysRq 按下)
         keycode[1] = seq[i];
-        tud_hid_keyboard_report(0, modifier, keycode);
+        safe_hid_report(modifier, keycode);
         vTaskDelay(pdMS_TO_TICKS(200)); // 模拟人手按压的持续时间
 
         // 松开字母键 (但保持 Alt+SysRq 按下)
         keycode[1] = 0; 
-        tud_hid_keyboard_report(0, modifier, keycode);
+        safe_hid_report(modifier, keycode);
         
         // 【灵魂细节】：进程结束和硬盘同步需要时间！
         if (seq[i] == HID_KEY_S) {
@@ -342,7 +361,7 @@ static void reisub_macro_task(void *arg) {
     }
 
     // 3. 宏发送完毕，释放所有按键
-    tud_hid_keyboard_report(0, 0, NULL);
+    safe_hid_report(0, NULL);
     ESP_LOGI(TAG, "REISUB macro complete. System should reboot now.");
     
     // 销毁当前任务
@@ -355,8 +374,79 @@ void trigger_linux_reisub(void) {
     xTaskCreate(reisub_macro_task, "reisub_task", 2048, NULL, 5, NULL);
 }
 
+static void win_boot_macro_task(void *arg) {
+    ESP_LOGI(TAG, "Waiting for PC USB enumeration (GRUB phase)...");
+    uint32_t wait_ms = 0;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    // 1. 死等握手信号，最长等待 40 秒
+    while (!tud_hid_ready()) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_ms += 100;
+        if (wait_ms > 40000) {
+            ESP_LOGW(TAG, "PC boot timeout, macro aborted.");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    
+    ESP_LOGI(TAG, "GRUB Ready! Spamming 'W' for 5 seconds...");
+    
+    // 2. 握手成功，开始连发 W 键 (50次循环 * 100ms = 5秒)
+    // GRUB 界面对于键盘按下的判定比较敏感，我们模拟 50ms 压下，50ms 抬起
+    // 2. 握手成功，开始连发 W 键
+    for (int i = 0; i < 50; i++) {
+        uint8_t keycode[6] = {HID_KEY_W, 0};
+        
+        // 【关键修复】：使用安全发送，确保按下送达
+        safe_hid_report(0, keycode);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // 【救命核心】：使用安全发送，确保“松开指令”绝不丢失！
+        safe_hid_report(0, NULL);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    ESP_LOGI(TAG, "Windows boot macro finished.");
+    vTaskDelete(NULL);
+}
+
+void trigger_windows_boot_macro(void) {
+    // 创建一个后台任务，绝对不阻塞 LVGL 渲染
+    xTaskCreate(win_boot_macro_task, "win_boot_task", 2048, NULL, 5, NULL);
+}
+
+void print_task_stats() {
+    // 申请一块足够大的内存来存放统计字符串
+    char *buf = malloc(2048);
+    if (buf == NULL) return;
+
+    printf("\n任务名称       状态   优先级  剩余堆栈   任务编号   CPU核心\n");
+    printf("----------------------------------------------------------\n");
+    // vTaskList 会列出任务名称、状态、优先级、剩余堆栈
+    vTaskList(buf);
+    printf("%s", buf);
+
+    printf("\n任务名称       运行时间(绝对值)    百分比\n");
+    printf("----------------------------------------\n");
+    // vTaskGetRunTimeStats 会列出每个任务消耗 CPU 的百分比
+    vTaskGetRunTimeStats(buf);
+    printf("%s", buf);
+
+    free(buf);
+}
+
 void app_main(void)
 {
+
+    #if CONFIG_PM_ENABLE
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = 240,        // 满血爆发频率，确保 LVGL 动画和蓝牙出击绝不卡顿
+            .min_freq_mhz = 80,         // 挂机退烧频率，设为 80MHz 确保 SPI 屏幕不闪烁、不撕裂
+            .light_sleep_enable = false // 带有 LCD 屏幕的设备强力建议设为 false，防止花屏
+        };
+        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+        ESP_LOGI(TAG, "Dynamic Frequency Scaling enabled! Min: 80MHz, Max: 240MHz");
+    #endif
 
     // 1. 初始化 NVS 闪存 (必须，用于存储 Wi-Fi 账密)
     esp_err_t ret = nvs_flash_init();
@@ -394,6 +484,7 @@ void app_main(void)
     // 3. 配置 Wi-Fi 模式为 STA
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     // 4. 注册刚才写的事件回调函数
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
@@ -546,6 +637,7 @@ void app_main(void)
     // 永不退出的主循环 (LVGL 的心跳引擎)
     // =======================================
     uint32_t last_ms = esp_timer_get_time() / 1000;
+    //static uint32_t last_stats_ms = 0;
     
     while (1) {
         // 1. 精确计算经过的毫秒数，喂给 LVGL
@@ -558,5 +650,10 @@ void app_main(void)
         
         // 3. 【关键修改 3】延时至少 10ms (也就是 1 个完整的 Tick)，把 CPU 喘息的时间还给看门狗！
         vTaskDelay(pdMS_TO_TICKS(10)); 
+        
+        // if (current_ms - last_stats_ms > 5000) {
+        // print_task_stats();
+        // last_stats_ms = current_ms;
     }
+    
 }

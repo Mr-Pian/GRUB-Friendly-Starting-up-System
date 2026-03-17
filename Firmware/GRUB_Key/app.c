@@ -51,6 +51,45 @@ static uint8_t advertising_set_handle = 0xff;
 // 0xFF 代表当前没有设备连接
 static uint8_t esp32_connection = 0xFF;
 
+// ==========================================
+// 全局状态记录 (用于广播)
+// ==========================================
+static uint16_t current_batt_mv = 0;
+static uint8_t current_pc_state = 0;
+
+// 自定义更新广播数据的核心函数
+static void update_adv_data(void) {
+  uint8_t adv_data[31];
+  uint8_t idx = 0;
+
+  // 1. 标志位 Flags (0x01)
+  adv_data[idx++] = 2;    // 长度
+  adv_data[idx++] = 0x01; // AD Type: Flags
+  adv_data[idx++] = 0x06; // LE General Discoverable, BR/EDR Not Supported
+
+  // 2. 厂商自定义数据 Manufacturer Specific Data (0xFF)
+  // 长度 = Type(1) + CompanyID(2) + NodeID(1) + State(1) + Batt(2) = 7
+  adv_data[idx++] = 7;
+  adv_data[idx++] = 0xFF; // AD Type: 厂商自定义数据
+  adv_data[idx++] = 0xFF; // Company ID L (与 ESP32 约定的 0xFFFF)
+  adv_data[idx++] = 0xFF; // Company ID H
+  adv_data[idx++] = 0x00; // Node ID (当前为主机 0)
+  adv_data[idx++] = current_pc_state; // 开关机状态 (1 = 开, 0 = 关)
+  adv_data[idx++] = (uint8_t)(current_batt_mv & 0xFF);         // 电池电压低字节
+  adv_data[idx++] = (uint8_t)((current_batt_mv >> 8) & 0xFF);  // 电池电压高字节
+
+  // 3. (可选) 给设备起个名字，ESP32 备用策略会抓名字 "Empty Example" 或自定义
+  const char *name = "GRUB_Key";
+  uint8_t name_len = strlen(name);
+  adv_data[idx++] = name_len + 1;
+  adv_data[idx++] = 0x09; // AD Type: Complete Local Name
+  memcpy(&adv_data[idx], name, name_len);
+  idx += name_len;
+
+  // 将打包好的数据塞给蓝牙协议栈 (0 代表针对普通广播包)
+  sl_bt_legacy_advertiser_set_data(advertising_set_handle, 0, idx, adv_data);
+}
+
 /**************************************************************************//**
  * Application Init.
  *****************************************************************************/
@@ -133,40 +172,25 @@ static uint16_t read_battery_mv(void)
 static void battery_timer_callback(app_timer_t *timer, void *data)
 {
   (void)timer;
-  (void)data;
+    (void)data;
 
-  // 【绝杀机制】：如果没有设备连接，我们先把射频广播停掉！
-  if (esp32_connection == 0xFF) {
-    sl_bt_advertiser_stop(advertising_set_handle);
+    if (esp32_connection == 0xFF) {
+      sl_bt_advertiser_stop(advertising_set_handle);
+      sl_udelay_wait(5000);
+    }
 
-    // 延时 5 毫秒 (5000微秒)
-    // 射频关断后，给 CR2032 充足的时间让内部化学反应恢复，电压回升到绝对真实的空载值
-    sl_udelay_wait(5000);
-  }
+    // 1. 测电压
+    uint16_t batt_mv = read_battery_mv();
+    current_batt_mv = batt_mv;
 
-  // 1. 测电压 (此时射频绝对是死寂状态，加上之前的 16 次过采样，测出来的值纯净无比)
-  uint16_t batt_mv = read_battery_mv();
-  uint8_t batt_data[2];
-  batt_data[0] = (uint8_t)(batt_mv & 0xFF);
-  batt_data[1] = (uint8_t)((batt_mv >> 8) & 0xFF);
+    // 2. 更新广播数据 (大喇叭喊话)
+    update_adv_data();
 
-  // 2. 如果 ESP32 连着，直接 Notify 推送给它
-  if (esp32_connection != 0xFF) {
-    sl_bt_gatt_server_send_notification(esp32_connection,
-                                        gattdb_xgatt_batt_tx,
-                                        2,
-                                        batt_data);
-  } else {
-    // 3. 测完之后，如果没连接，别忘了把广播重新打开！否则 ESP32 就永远找不到它了
-    sl_bt_legacy_advertiser_start(advertising_set_handle,
-                                  sl_bt_legacy_advertiser_connectable);
-  }
-
-  // 4. 无论连不连着，都把最新电压写入本地 GATT 缓存
-  sl_bt_gatt_server_write_attribute_value(gattdb_xgatt_batt_tx,
-                                          0,
-                                          2,
-                                          batt_data);
+    // 3. 如果没连接，重新开启广播
+    if (esp32_connection == 0xFF) {
+      sl_bt_legacy_advertiser_start(advertising_set_handle,
+                                    sl_bt_legacy_advertiser_connectable);
+    }
 }
 
 void custom_gpio_init(void)
@@ -241,8 +265,11 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
             app_assert_status(sc);
 
             // 生成广播数据
-            sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
-                                                       sl_bt_advertiser_general_discoverable);
+            current_pc_state = (uint8_t)GPIO_PinInGet(gpioPortC, 2);
+            current_batt_mv = read_battery_mv();
+            update_adv_data(); // 替代原先的 generate_data
+            //sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
+            //                                         sl_bt_advertiser_general_discoverable);
             app_assert_status(sc);
 
             // 【核心优化】：把广播间隔从 100ms 爆改到 1000ms (1秒)
@@ -280,8 +307,13 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
     case sl_bt_evt_connection_closed_id:
       esp32_connection = 0xFF; //重置ID
       // Generate data for advertising
-      sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
-                                                 sl_bt_advertiser_general_discoverable);
+      //sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
+      //                                                                  sl_bt_advertiser_general_discoverable);
+
+      current_pc_state = (uint8_t)GPIO_PinInGet(gpioPortC, 2);
+      current_batt_mv = read_battery_mv();
+      update_adv_data();
+
       app_assert_status(sc);
 
       // Restart advertising after client has disconnected.
@@ -330,57 +362,15 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
       break;
 
       case sl_bt_evt_system_external_signal_id:
-            // 判断是不是我们刚才定义的 1 号信号 (PC02 触发的)
-            if (evt->data.evt_system_external_signal.extsignals == 1) {
+        if (evt->data.evt_system_external_signal.extsignals == 1) {
+                        // 读取最新状态并更新广播
+                      current_pc_state = (uint8_t)GPIO_PinInGet(gpioPortC, 2);
+                      update_adv_data();
 
-              // 1. 确保 ESP32 (或手机) 当前是连着蓝牙的
-              if (esp32_connection != 0xFF) {
-
-                // 2. 读取 PC02 的当前电平 (0 或 1)
-                uint8_t pc02_state = (uint8_t)GPIO_PinInGet(gpioPortC, 2);
-
-                // 3. 把状态通过 Status TX 信箱 Notify 出去
-                sl_bt_gatt_server_send_notification(
-                  esp32_connection,
-                  gattdb_xgatt_status_tx, // 你之前在 GATT 里配好的特征值 ID
-                  1,                      // 发送长度: 1 byte
-                  &pc02_state             // 发送的数据指针
-                );
-              }
-            }
+                      // 【删除】：把里面 if (esp32_connection != 0xFF) {...}
+                      // 推送 Notification 的代码整块删掉！
+                    }
        break;
-
-       // ---------------------------------------------------------
-       // 核心时序修复：当客户端 (手机/ESP32) 开启 Notify 订阅时，立刻推送一次电量
-       // ---------------------------------------------------------
-       case sl_bt_evt_gatt_server_characteristic_status_id:
-         // 1. 检查是不是我们的 Battery TX 信箱发生了状态改变
-         if (evt->data.evt_gatt_server_characteristic_status.characteristic == gattdb_xgatt_batt_tx) {
-
-           // 2. 检查改变的原因是不是“客户端修改了配置 (Client Config)”
-           if (evt->data.evt_gatt_server_characteristic_status.status_flags == sl_bt_gatt_server_client_config) {
-
-             // 3. 检查客户端是不是开启了 Notification (值为 1)
-             if (evt->data.evt_gatt_server_characteristic_status.client_config_flags == sl_bt_gatt_server_notification) {
-
-               // --- 完美时机：此时客户端已经张开嘴准备好接收了！ ---
-               uint16_t batt_mv = read_battery_mv();
-               uint8_t batt_data[2];
-               batt_data[0] = (uint8_t)(batt_mv & 0xFF);
-               batt_data[1] = (uint8_t)((batt_mv >> 8) & 0xFF);
-
-               // 准确无误地推送给它
-               sl_bt_gatt_server_send_notification(
-                 esp32_connection,
-                 gattdb_xgatt_batt_tx,
-                 2,
-                 batt_data
-               );
-             }
-           }
-         }
-         break;
-
     // -------------------------------
     // Default event handler.
     default:

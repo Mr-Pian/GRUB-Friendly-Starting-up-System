@@ -80,29 +80,11 @@
 
     <!--Command RX-->
     <characteristic const="false" id="xgatt_cmd_rx" name="Command RX" sourceId="" uuid="930c2db4-e3f2-4af1-b9e2-edceed603b71">
-      <informativeText>Ã§ÂÂ¨Ã¤ÂºÂÃ¦ÂÂ¥Ã¦ÂÂ¶Ã¦ÂÂ§Ã¥ÂÂ¶Ã¤Â¿Â¡Ã¦ÂÂ¯</informativeText>
+      <informativeText>ÃÂ§ÃÂÃÂ¨ÃÂ¤ÃÂºÃÂÃÂ¦ÃÂÃÂ¥ÃÂ¦ÃÂÃÂ¶ÃÂ¦ÃÂÃÂ§ÃÂ¥ÃÂÃÂ¶ÃÂ¤ÃÂ¿ÃÂ¡ÃÂ¦ÃÂÃÂ¯</informativeText>
       <value length="1" type="hex" variable_length="false">00</value>
       <properties>
         <write authenticated="false" bonded="false" encrypted="false"/>
         <write_no_response authenticated="false" bonded="false" encrypted="false"/>
-      </properties>
-    </characteristic>
-
-    <!--Status TX-->
-    <characteristic const="false" id="xgatt_status_tx" name="Status TX" sourceId="" uuid="6d201b0f-6b4a-424e-a517-102405574ecb">
-      <informativeText>Ã¤Â¸Â»Ã¦ÂÂ¿Ã§ÂÂ¶Ã¦ÂÂÃ¦ÂÂÃ§Â¤Âº</informativeText>
-      <value length="1" type="hex" variable_length="false">00</value>
-      <properties>
-        <notify authenticated="false" bonded="false" encrypted="false"/>
-      </properties>
-    </characteristic>
-
-    <!--Battery TX-->
-    <characteristic const="false" id="xgatt_batt_tx" name="Battery TX" sourceId="" uuid="7d45fb73-5833-451a-ab5e-9e0b8be96fe4">
-      <informativeText>Ã¦Â¨Â¡Ã¥ÂÂÃ§ÂÂµÃ¦Â±Â Ã§ÂÂµÃ¥ÂÂÃ©ÂÂÃ§Â©Â¿</informativeText>
-      <value length="2" type="hex" variable_length="false">00</value>
-      <properties>
-        <notify authenticated="false" bonded="false" encrypted="false"/>
       </properties>
     </characteristic>
   </service>

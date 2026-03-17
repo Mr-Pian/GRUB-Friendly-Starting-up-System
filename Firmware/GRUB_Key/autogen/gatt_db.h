@@ -21,8 +21,6 @@ extern const sli_bt_gattdb_t gattdb;
 #define gattdb_firmware_revision_string       22
 #define gattdb_system_id                      24
 #define gattdb_xgatt_cmd_rx                   27
-#define gattdb_xgatt_status_tx                29
-#define gattdb_xgatt_batt_tx                  32
 
 
 #endif // __GATT_DB_H
