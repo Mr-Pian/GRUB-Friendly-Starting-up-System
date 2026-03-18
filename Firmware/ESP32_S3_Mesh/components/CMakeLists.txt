@@ -7,4 +7,4 @@ idf_component_register(SRCS "LVGL_UI.c"
                             "Fonts/ka1.c" 
                             "ble_client.c" 
                        INCLUDE_DIRS "." 
-                       REQUIRES lvgl esp_timer bt nvs_flash log driver)
+                       REQUIRES lvgl esp_timer bt nvs_flash log driver nvs_flash)

@@ -33,11 +33,15 @@
 // 必须引入 LVGL 核心头文件
 #include "lvgl.h" 
 #include "LVGL_UI.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h" // 用于自动校验 HTTPS 证书 (Let's Encrypt)
+#include "cJSON.h"          // 用于生成和解析 JSON 数据
 
 static const char *TAG = "LCD_TEST";
 // 加上 volatile 防止被编译器优化，专门给后台任务和 UI 桥接用
 volatile bool g_wifi_connected = false;
 volatile bool g_is_provisioning = false; // 【新增】标记是否正在配网
+volatile bool g_server_connected = false; // 记录公网服务器存活状态
 
 #define PIN_NUM_MOSI   11  
 #define PIN_NUM_CLK    12  
@@ -375,10 +379,10 @@ void trigger_linux_reisub(void) {
 }
 
 static void win_boot_macro_task(void *arg) {
-    ESP_LOGI(TAG, "Waiting for PC USB enumeration (GRUB phase)...");
+    ESP_LOGI(TAG, "Waiting for PC USB enumeration (BIOS phase)...");
     uint32_t wait_ms = 0;
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    // 1. 死等握手信号，最长等待 40 秒
+    
+    // 1. 等待主板 BIOS/UEFI 首次给 USB 供电并握手
     while (!tud_hid_ready()) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_ms += 100;
@@ -389,23 +393,30 @@ static void win_boot_macro_task(void *arg) {
         }
     }
     
-    ESP_LOGI(TAG, "GRUB Ready! Spamming 'W' for 5 seconds...");
+    // 【关键修复 1】：跳过主板 LOGO 自检期！
+    // 此时 BIOS 刚认识键盘，但 GRUB 还没出来。
+    // 根据你电脑开机的实际速度，在这里盲等 3~6 秒。我先给你设了 4 秒。
+    ESP_LOGI(TAG, "BIOS USB Ready! Sleeping 4 seconds to bypass Motherboard POST...");
+    vTaskDelay(pdMS_TO_TICKS(4000)); 
     
-    // 2. 握手成功，开始连发 W 键 (50次循环 * 100ms = 5秒)
-    // GRUB 界面对于键盘按下的判定比较敏感，我们模拟 50ms 压下，50ms 抬起
-    // 2. 握手成功，开始连发 W 键
-    for (int i = 0; i < 50; i++) {
+    ESP_LOGI(TAG, "Initiating 15-second 'W' spam for GRUB...");
+    
+    // 【关键修复 2】：扩大火力覆盖，并降低按键频率防止 GRUB 吞键！
+    // 循环 75 次 * (100ms按下 + 100ms松开) = 15 秒的持续火力
+    for (int i = 0; i < 75; i++) {
         uint8_t keycode[6] = {HID_KEY_W, 0};
         
-        // 【关键修复】：使用安全发送，确保按下送达
+        // 按下 W，保持 100ms (给迟钝的 GRUB 足够的反应时间)
         safe_hid_report(0, keycode);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(100));
         
-        // 【救命核心】：使用安全发送，确保“松开指令”绝不丢失！
+        // 松开 W，保持 100ms
         safe_hid_report(0, NULL);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     
+    // 发送最后一次清空包，确保绝对不卡键
+    safe_hid_report(0, NULL);
     ESP_LOGI(TAG, "Windows boot macro finished.");
     vTaskDelete(NULL);
 }
@@ -433,6 +444,106 @@ void print_task_stats() {
     printf("%s", buf);
 
     free(buf);
+}
+
+// =========================================================
+// 公网服务器联动引擎 (HTTP 心跳与指令下发)
+// =========================================================
+static void server_sync_task(void *arg) {
+    char post_data[128];
+    char response_buffer[512];
+
+    // 1. 【发热优化】：将初始化移出死循环！
+    // 保持 TCP/TLS 长连接，避免每 3 秒做一次极度耗费 CPU 的非对称加密握手
+    esp_http_client_config_t config = {
+        .url = "https://boot.mambo.icu/api/esp/sync",
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 4000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    while (1) {
+        if (!g_wifi_connected) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+
+        for (int i = 0; i < 2; i++) {
+            bool online = false, pc_on = false;
+            uint16_t batt = 0;
+
+            ui_get_node_state(i, &online, &pc_on, &batt);
+            if (!online) continue;
+
+            snprintf(post_data, sizeof(post_data), 
+                     "{\"node\":\"%s\",\"batt\":%.2f,\"pc_on\":%s}",
+                     (i == 0) ? "mambo" : "kang",
+                     batt / 1000.0f,
+                     pc_on ? "true" : "false");
+
+            // 2. 每次循环只更新 Body 数据
+            esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+            esp_err_t err = esp_http_client_open(client, strlen(post_data));
+            if (err == ESP_OK) {
+                esp_http_client_write(client, post_data, strlen(post_data));
+                esp_http_client_fetch_headers(client);
+                
+                g_server_connected = true; 
+                
+                int total_read = 0;
+                while (total_read < sizeof(response_buffer) - 1) {
+                    int len = esp_http_client_read_response(client, response_buffer + total_read, sizeof(response_buffer) - 1 - total_read);
+                    if (len <= 0) break; 
+                    total_read += len;
+                }
+                response_buffer[total_read] = '\0'; 
+                
+                if (total_read > 0) {
+                    cJSON *root = cJSON_Parse(response_buffer);
+                    if (root != NULL) {
+                        cJSON *has_cmd = cJSON_GetObjectItem(root, "has_cmd");
+                        
+                        if (has_cmd && cJSON_IsTrue(has_cmd)) {
+                            cJSON *action = cJSON_GetObjectItem(root, "action");
+                            cJSON *os = cJSON_GetObjectItem(root, "os");
+                            
+                            if (action && action->valuestring) {
+                                uint8_t cmd_code = 0;
+                                if (strcmp(action->valuestring, "boot") == 0) cmd_code = 0x01;
+                                else if (strcmp(action->valuestring, "reset") == 0) cmd_code = 0x02;
+                                else if (strcmp(action->valuestring, "force_off") == 0) cmd_code = 0x03;
+
+                                if (cmd_code != 0) {
+                                    ESP_LOGI(TAG, "⚡ [Server Command] Executing %s for node %d", action->valuestring, i);
+                                    ble_trigger_pc_command(i, cmd_code);
+
+                                    if (i == 0 && cmd_code == 0x01 && os && os->valuestring) {
+                                        if (strcmp(os->valuestring, "win") == 0) {
+                                            ESP_LOGI(TAG, "⌨️ [Server Command] Triggering Windows GRUB Macro...");
+                                            trigger_windows_boot_macro();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cJSON_Delete(root);
+                    }
+                }
+                // 3. 【发热优化】：用 close 代替 cleanup，仅关闭当前流，但保持 TLS Session 不死！
+                esp_http_client_close(client);
+            } else {
+                g_server_connected = false;
+                ESP_LOGE(TAG, "HTTP Open failed: %s", esp_err_to_name(err));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    // 虽然是个死循环永远走不到这里，但语法上写上防止警告
+    esp_http_client_cleanup(client);
 }
 
 void app_main(void)
@@ -633,6 +744,7 @@ void app_main(void)
     // =======================================
     setup_grub_os_ui();
 
+    xTaskCreatePinnedToCore(server_sync_task, "server_sync", 8192, NULL, 5, NULL, 1);
     // =======================================
     // 永不退出的主循环 (LVGL 的心跳引擎)
     // =======================================

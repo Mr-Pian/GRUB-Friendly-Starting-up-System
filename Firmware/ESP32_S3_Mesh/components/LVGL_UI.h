@@ -18,6 +18,6 @@
 #include "string.h"
 
 void setup_grub_os_ui();
-
+void ui_get_node_state(uint8_t node, bool *is_online, bool *pc_on, uint16_t *batt_mv);
 
 #endif

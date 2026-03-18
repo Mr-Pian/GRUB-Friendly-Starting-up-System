@@ -2,7 +2,10 @@
 // 【修复 1】：引入蓝牙头文件，打通底层接口和回调函数的跨文件链接
 #include "ble_client.h" 
 #include "driver/ledc.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
+extern volatile bool g_server_connected;
 extern volatile bool g_wifi_connected;
 extern volatile bool g_is_provisioning;
 extern void stop_smartconfig(void);
@@ -68,6 +71,7 @@ static lv_obj_t * lbl_batt[2] = {NULL, NULL};
 static lv_obj_t * lbl_node_name[2] = {NULL, NULL};
 static lv_obj_t * lbl_conn_time[2] = {NULL, NULL};
 static uint32_t conn_start_time[2] = {0, 0};
+static uint16_t current_batt_mv[2] = {0, 0};
 
 // 【新增】：记录当前亮度的全局变量
 static uint8_t current_active_bri = 80;
@@ -75,12 +79,51 @@ static uint8_t current_aod_bri = 20;
 
 static uint8_t selected_os = 0; // 0 for Arch, 1 for Win
 
+// 暴露出底层的物理状态，供 main.c 的 HTTP 任务读取
+void ui_get_node_state(uint8_t node, bool *is_online, bool *pc_on, uint16_t *batt_mv) {
+    if(node < 2) {
+        *is_online = ble_is_connected[node];
+        *pc_on = pc_is_on[node];
+        *batt_mv = current_batt_mv[node];
+    }
+}
+
 // 【新增】：一个通用的底层背光刷新函数
 static void update_hw_backlight(uint8_t percent) {
-    // 13位分辨率，最大值是 (2^13 - 1) = 8191
-    uint32_t duty = (percent * 8191) / 100;
+    // 【物理截断】：满载是 8191，我们砍掉最亮的 20%，最高限制在 6553 左右
+    uint32_t max_duty = 8191 * 0.8; 
+    
+    // 【Gamma 平方校正】：percent * percent / 10000 
+    // 这样推 50% 时，实际输出只有 25%，把大量的滑动空间留给了低亮度区间！
+    uint32_t duty = (percent * percent * max_duty) / 10000;
+    
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void load_brightness_from_nvs(void) {
+    nvs_handle_t my_handle;
+    // 打开命名空间 "storage"
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        nvs_get_u8(my_handle, "act_bri", &current_active_bri);
+        nvs_get_u8(my_handle, "aod_bri", &current_aod_bri);
+        nvs_close(my_handle);
+    }
+}
+
+static void save_brightness_to_nvs(void) {
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        nvs_set_u8(my_handle, "act_bri", current_active_bri);
+        nvs_set_u8(my_handle, "aod_bri", current_aod_bri);
+        nvs_commit(my_handle); // 必须 commit 才会写入物理 Flash
+        nvs_close(my_handle);
+    }
+}
+
+// 【新增】：专门用于 LVGL 松手时的回调
+static void slider_save_nvs_cb(lv_event_t * e) {
+    save_brightness_to_nvs();
 }
 
 // 【新增】：正常亮度调节回调（实时生效）
@@ -129,13 +172,9 @@ void ui_ble_real_pc_state_cb(uint8_t target_node, bool is_on, uint16_t batt_mv) 
         // 1. 同步最真实的物理开机状态
         pc_is_on[target_node] = is_on; 
         
-        // 2. 将毫伏(mV)电压转换为浮点数并刷新到 UI 标签上
-        if(lbl_batt[target_node]) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), LV_SYMBOL_BATTERY_FULL " %.3fV", batt_mv / 1000.0f);
-            lv_label_set_text(lbl_batt[target_node], buf);
-            //lv_label_set_text(lbl_batt[target_node], buf);
-        }
+        // 2. 【核心修复】：绝对不能在这里调用 lv_label_set_text！
+        // 只把电压缓存到全局变量，剩下的交给 LVGL 自己的定时器去画。
+        current_batt_mv[target_node] = batt_mv; 
     }
 }
 
@@ -242,7 +281,12 @@ static void ui_state_update_task(lv_timer_t * timer) {
                     lv_label_set_text(lbl_conn_time[n], t_buf);
                 }
                 if(lbl_node_name[n]) lv_obj_set_style_text_color(lbl_node_name[n], lv_color_hex(0x17A2B8), 0); // 青蓝色
-                if(lbl_batt[n])      lv_obj_set_style_text_color(lbl_batt[n], lv_color_hex(0x28A745), 0);      // 绿色
+                if(lbl_batt[n]) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), LV_SYMBOL_BATTERY_FULL " %.3fV", current_batt_mv[n] / 1000.0f);
+                    lv_label_set_text(lbl_batt[n], buf); // 安全刷新文字
+                    lv_obj_set_style_text_color(lbl_batt[n], lv_color_hex(0x28A745), 0); // 变绿
+                }
                 if(lbl_conn_time[n]) lv_obj_set_style_text_color(lbl_conn_time[n], lv_color_hex(0xFFFFFF), 0); // 白色
             }
         }
@@ -281,9 +325,15 @@ static void ui_state_update_task(lv_timer_t * timer) {
     // 刷新所有的状态栏
     for(int i = 0; i < status_bar_cnt; i++) {
         if(wifi_icons[i]) {
-            if(g_wifi_connected) {
-                lv_obj_set_style_text_color(wifi_icons[i], lv_color_hex(0x118219), 0); 
+            // 【三重网络状态判断】
+            if(g_server_connected) {
+                // 状态 1：彻底连通公网服务器 -> 耀眼绿
+                lv_obj_set_style_text_color(wifi_icons[i], lv_color_hex(0x28A745), 0); 
+            } else if (g_wifi_connected) {
+                // 状态 2：路由器连上了，但服务器没理你 -> 警告橙
+                lv_obj_set_style_text_color(wifi_icons[i], lv_color_hex(0xFF9800), 0); 
             } else {
+                // 状态 3：连 Wi-Fi 都没连上 -> 掉线红
                 lv_obj_set_style_text_color(wifi_icons[i], lv_color_hex(0xd40f12), 0); 
             }
         }
@@ -731,8 +781,9 @@ static void init_settings_screen() {
     lv_obj_t * slider_bri = lv_slider_create(int_settings);
     lv_obj_set_size(slider_bri, 140, 10);
     lv_obj_align(slider_bri, LV_ALIGN_TOP_LEFT, 20, 45);
-    lv_slider_set_value(slider_bri, 80, LV_ANIM_OFF);
+    lv_slider_set_value(slider_bri, current_active_bri, LV_ANIM_OFF);
     lv_obj_add_event_cb(slider_bri, slider_active_bri_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider_bri, slider_save_nvs_cb, LV_EVENT_RELEASED, NULL);
 
     lv_obj_t * lbl_aod = lv_label_create(int_settings);
     lv_label_set_text(lbl_aod, LV_SYMBOL_EYE_CLOSE " AOD Brightness");
@@ -742,8 +793,9 @@ static void init_settings_screen() {
     lv_obj_t * slider_aod = lv_slider_create(int_settings);
     lv_obj_set_size(slider_aod, 140, 10);
     lv_obj_align(slider_aod, LV_ALIGN_TOP_LEFT, 20, 75);
-    lv_slider_set_value(slider_aod, 20, LV_ANIM_OFF);
+    lv_slider_set_value(slider_aod, current_aod_bri, LV_ANIM_OFF);
     lv_obj_add_event_cb(slider_aod, slider_aod_bri_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider_aod, slider_save_nvs_cb, LV_EVENT_RELEASED, NULL);
 
     lv_obj_t * btn_wifi = lv_button_create(int_settings);
     lv_obj_set_size(btn_wifi, 135, 35);
@@ -867,6 +919,8 @@ static void init_custom_focus_style() {
 }
 
 void setup_grub_os_ui() {
+    load_brightness_from_nvs();
+
     init_custom_focus_style();
     g_main = lv_group_create();
     lv_indev_t * indev = lv_indev_get_next(NULL);
@@ -891,4 +945,6 @@ void setup_grub_os_ui() {
     lv_timer_create(ui_state_update_task, 1000, NULL);
 
     ble_client_register_callbacks(ui_ble_connection_state_cb, ui_ble_command_result_cb, ui_ble_real_pc_state_cb);
+
+    update_hw_backlight(current_active_bri);
 }
