@@ -73,13 +73,13 @@ static void update_adv_data(void) {
   adv_data[idx++] = 0xFF; // AD Type: 厂商自定义数据
   adv_data[idx++] = 0xFF; // Company ID L (与 ESP32 约定的 0xFFFF)
   adv_data[idx++] = 0xFF; // Company ID H
-  adv_data[idx++] = 0x00; // Node ID (当前为主机 0)
+  adv_data[idx++] = 0x01; // Node ID (当前为主机 0)
   adv_data[idx++] = current_pc_state; // 开关机状态 (1 = 开, 0 = 关)
   adv_data[idx++] = (uint8_t)(current_batt_mv & 0xFF);         // 电池电压低字节
   adv_data[idx++] = (uint8_t)((current_batt_mv >> 8) & 0xFF);  // 电池电压高字节
 
   // 3. (可选) 给设备起个名字，ESP32 备用策略会抓名字 "Empty Example" 或自定义
-  const char *name = "GRUB_Key";
+  const char *name = "GRUB_Key_2";
   uint8_t name_len = strlen(name);
   adv_data[idx++] = name_len + 1;
   adv_data[idx++] = 0x09; // AD Type: Complete Local Name
@@ -119,53 +119,58 @@ static void long_press_callback(app_timer_t *timer, void *data)
 static void init_battery_adc(void)
 {
   IADC_Init_t init = IADC_INIT_DEFAULT;
-  IADC_AllConfigs_t allConfigs = IADC_ALLCONFIGS_DEFAULT;
-  IADC_InitSingle_t initSingle = IADC_INITSINGLE_DEFAULT;
-  IADC_SingleInput_t singleInput = IADC_SINGLEINPUT_DEFAULT;
+    IADC_AllConfigs_t allConfigs = IADC_ALLCONFIGS_DEFAULT;
+    IADC_InitSingle_t initSingle = IADC_INITSINGLE_DEFAULT;
+    IADC_SingleInput_t singleInput = IADC_SINGLEINPUT_DEFAULT;
 
-  // 开启 IADC 时钟
-  CMU_ClockEnable(cmuClock_IADC0, true);
-  init.srcClkPrescale = IADC_calcSrcClkPrescale(IADC0, 20000000, 0);
+    // 开启 IADC 时钟
+    CMU_ClockEnable(cmuClock_IADC0, true);
+    init.srcClkPrescale = IADC_calcSrcClkPrescale(IADC0, 20000000, 0);
 
-  // 配置内部 1.21V 参考电压
-  allConfigs.configs[0].reference = iadcCfgReferenceInt1V2;
-  allConfigs.configs[0].vRef = 1210;
-  allConfigs.configs[0].analogGain = iadcCfgAnalogGain1x;
+    // 配置内部 1.21V 参考电压
+    allConfigs.configs[0].reference = iadcCfgReferenceInt1V2;
+    allConfigs.configs[0].vRef = 1210;
+    allConfigs.configs[0].analogGain = iadcCfgAnalogGain1x;
 
-  // 核心：正极输入强行连到内部的 AVDD (电池端)，负极连 GND
-  singleInput.posInput = iadcPosInputAvdd;
-  singleInput.negInput = iadcNegInputGnd;
+    allConfigs.configs[0].adcClkPrescale = IADC_calcAdcClkPrescale(IADC0,
+                                                                     1000000,
+                                                                     0,
+                                                                     iadcCfgModeNormal,
+                                                                     init.srcClkPrescale);
 
-  IADC_init(IADC0, &init, &allConfigs);
-  IADC_initSingle(IADC0, &initSingle, &singleInput);
+    // 正极输入强行连到内部的 AVDD (电池端)，负极连 GND
+    singleInput.posInput = iadcPosInputAvdd;
+    singleInput.negInput = iadcNegInputGnd;
+
+    IADC_init(IADC0, &init, &allConfigs);
+    IADC_initSingle(IADC0, &initSingle, &singleInput);
 }
 
 // 触发一次测量，并返回毫伏值 (mV)
 static uint16_t read_battery_mv(void)
 {
   uint32_t total_sample = 0;
-  // 采样 16 次 (强烈建议用 2 的幂次方，编译器会自动把除法优化成极其省电的位移运算)
-  const uint8_t sample_count = 16;
+    // 采样 32 次
+    const uint8_t sample_count = 32;
 
-  for (uint8_t i = 0; i < sample_count; i++) {
-    // 启动一次 ADC 测量
-    IADC_command(IADC0, iadcCmdStartSingle);
+    for (uint8_t i = 0; i < sample_count; i++) {
+      // 启动一次 ADC 测量
+      IADC_command(IADC0, iadcCmdStartSingle);
 
-    // 等待转换结束并且 FIFO 数据有效
-    while((IADC0->STATUS & (_IADC_STATUS_CONVERTING_MASK | _IADC_STATUS_SINGLEFIFODV_MASK)) != IADC_STATUS_SINGLEFIFODV);
+      // 等待转换结束并且 FIFO 数据有效
+      while((IADC0->STATUS & (_IADC_STATUS_CONVERTING_MASK | _IADC_STATUS_SINGLEFIFODV_MASK)) != IADC_STATUS_SINGLEFIFODV);
 
-    // 累加 12 位的原始采样数据
-    total_sample += IADC_pullSingleFifoResult(IADC0).data;
-  }
+      // 累加 12 位的原始采样数据
+      total_sample += IADC_pullSingleFifoResult(IADC0).data;
+    }
 
-  // 求平均值
-  uint32_t avg_sample = total_sample / sample_count;
+    // 求平均值
+    uint32_t avg_sample = total_sample / sample_count;
 
-  // 根据公式推算真实毫伏电压: V = avg_sample * 1.21 * 4 / 4095
-  // 为了避免浮点运算消耗 CPU，全部转换为整数乘法
-  uint16_t voltage_mv = (uint16_t)((avg_sample * 4840) / 4095);
+    // 根据公式推算真实毫伏电压
+    uint16_t voltage_mv = (uint16_t)((avg_sample * 4840) / 4095);
 
-  return voltage_mv;
+    return voltage_mv;
 }
 
 // 6小时定时器回调 (因为是非中断上下文，可以直接随便调蓝牙 API)
@@ -176,7 +181,7 @@ static void battery_timer_callback(app_timer_t *timer, void *data)
 
     if (esp32_connection == 0xFF) {
       sl_bt_advertiser_stop(advertising_set_handle);
-      sl_udelay_wait(5000);
+      sl_udelay_wait(50000);
     }
 
     // 1. 测电压
@@ -287,10 +292,10 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
                                                sl_bt_legacy_advertiser_connectable);
             app_assert_status(sc);
 
-            // --- 启动 6 小时 (21600000 毫秒) 循环定时器 ---
+            // --- 启动 3 小时 循环定时器 ---
                   // (测试时建议先写 5000 测 5 秒)
                   app_timer_start(&battery_timer,
-                                        21600000,
+                                        10800000,
                                         battery_timer_callback,
                                         NULL,
                                         true);

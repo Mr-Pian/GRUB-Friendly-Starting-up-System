@@ -42,6 +42,7 @@ static const char *TAG = "LCD_TEST";
 volatile bool g_wifi_connected = false;
 volatile bool g_is_provisioning = false; // 【新增】标记是否正在配网
 volatile bool g_server_connected = false; // 记录公网服务器存活状态
+volatile bool is_call_from_remote = false;
 
 #define PIN_NUM_MOSI   11  
 #define PIN_NUM_CLK    12  
@@ -322,6 +323,64 @@ static void safe_hid_report(uint8_t modifier, uint8_t keycode[]) {
     ESP_LOGW(TAG, "HID Endpoint busy, packet dropped!");
 }
 
+// 填充密码宏
+static void type_password_task(void *arg) {
+    if (!tud_hid_ready()) {
+        ESP_LOGW(TAG, "HID not ready, cannot type password!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Waking up screen and typing password...");
+
+    // 1. 发送一次“回车”来唤醒屏幕，并呼出密码输入框
+    uint8_t enter_key[6] = {HID_KEY_ENTER, 0};
+
+    // 2. 定义带修饰键的密码序列 (Pass1818)
+    typedef struct {
+        uint8_t modifier;
+        uint8_t key;
+    } key_stroke_t;
+
+    key_stroke_t password[] = {
+        {KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_P}, // 大写 P
+        {0, HID_KEY_A},                           // 小写 a
+        {0, HID_KEY_S},                           // 小写 s
+        {0, HID_KEY_S},                           // 小写 s
+        {0, HID_KEY_1},                           // 数字 1
+        {0, HID_KEY_8},                           // 数字 8
+        {0, HID_KEY_1},                           // 数字 1
+        {0, HID_KEY_8}                            // 数字 8
+    };
+    
+    // 3. 循环击键
+    int pwd_len = sizeof(password) / sizeof(password[0]);
+    for (int i = 0; i < pwd_len; i++) {
+        uint8_t keycode[6] = {password[i].key, 0};
+        
+        // 发送按键（带上 Shift 修饰符）
+        safe_hid_report(password[i].modifier, keycode);
+        vTaskDelay(pdMS_TO_TICKS(40));  // 模拟按下 40ms
+        
+        // 松开按键
+        safe_hid_report(0, NULL);
+        vTaskDelay(pdMS_TO_TICKS(60));  // 模拟按键间隙 60ms
+    }
+
+    // 4. 最后发送回车键提交密码
+    safe_hid_report(0, enter_key);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    safe_hid_report(0, NULL);
+
+    ESP_LOGI(TAG, "Password typed successfully!");
+    
+    vTaskDelete(NULL);
+}
+
+void trigger_password_macro(void) {
+    xTaskCreate(type_password_task, "type_pwd_task", 4096, NULL, 5, NULL);
+}
+
 static void reisub_macro_task(void *arg) {
 
     if (!tud_hid_ready()) {
@@ -447,23 +506,18 @@ void print_task_stats() {
 }
 
 // =========================================================
-// 公网服务器联动引擎 (HTTP 心跳与指令下发)
+// 公网服务器联动引擎 (HTTP 心跳) - 绝对不卡死的“阅后即焚”版
 // =========================================================
 static void server_sync_task(void *arg) {
     char post_data[128];
     char response_buffer[512];
 
-    // 1. 【发热优化】：将初始化移出死循环！
-    // 保持 TCP/TLS 长连接，避免每 3 秒做一次极度耗费 CPU 的非对称加密握手
     esp_http_client_config_t config = {
         .url = "https://boot.mambo.icu/api/esp/sync",
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 4000,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_method(client, HTTP_METHOD_POST);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
 
     while (1) {
         if (!g_wifi_connected) {
@@ -476,7 +530,7 @@ static void server_sync_task(void *arg) {
             uint16_t batt = 0;
 
             ui_get_node_state(i, &online, &pc_on, &batt);
-            if (!online) continue;
+            if (!online) continue; // 节点离线则不拉取
 
             snprintf(post_data, sizeof(post_data), 
                      "{\"node\":\"%s\",\"batt\":%.2f,\"pc_on\":%s}",
@@ -484,66 +538,91 @@ static void server_sync_task(void *arg) {
                      batt / 1000.0f,
                      pc_on ? "true" : "false");
 
-            // 2. 每次循环只更新 Body 数据
-            esp_http_client_set_post_field(client, post_data, strlen(post_data));
+            // 【终极绝杀 1】：每次都生成一个全新的客户端，不带任何历史包袱！
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_method(client, HTTP_METHOD_POST);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            
+            // 【终极绝杀 2】：直接告诉 Node.js/Nginx：“完事就挂断，别跟我 Keep-Alive！”
+            esp_http_client_set_header(client, "Connection", "close"); 
 
             esp_err_t err = esp_http_client_open(client, strlen(post_data));
             if (err == ESP_OK) {
                 esp_http_client_write(client, post_data, strlen(post_data));
                 esp_http_client_fetch_headers(client);
                 
-                g_server_connected = true; 
-                
+                int status_code = esp_http_client_get_status_code(client);
                 int total_read = 0;
+                memset(response_buffer, 0, sizeof(response_buffer));
+                
                 while (total_read < sizeof(response_buffer) - 1) {
                     int len = esp_http_client_read_response(client, response_buffer + total_read, sizeof(response_buffer) - 1 - total_read);
                     if (len <= 0) break; 
                     total_read += len;
                 }
-                response_buffer[total_read] = '\0'; 
                 
-                if (total_read > 0) {
-                    cJSON *root = cJSON_Parse(response_buffer);
-                    if (root != NULL) {
-                        cJSON *has_cmd = cJSON_GetObjectItem(root, "has_cmd");
+                // 必须是 200 OK 才算服务器真正连通
+                if (status_code == 200) {
+                    g_server_connected = true; 
+                    
+                    if (total_read > 0 && strstr(response_buffer, "\"has_cmd\":false") == NULL) {
+                        ESP_LOGW(TAG, "====================================");
+                        ESP_LOGW(TAG, "📦 Raw Response: %s", response_buffer);
                         
-                        if (has_cmd && cJSON_IsTrue(has_cmd)) {
-                            cJSON *action = cJSON_GetObjectItem(root, "action");
-                            cJSON *os = cJSON_GetObjectItem(root, "os");
-                            
-                            if (action && action->valuestring) {
-                                uint8_t cmd_code = 0;
-                                if (strcmp(action->valuestring, "boot") == 0) cmd_code = 0x01;
-                                else if (strcmp(action->valuestring, "reset") == 0) cmd_code = 0x02;
-                                else if (strcmp(action->valuestring, "force_off") == 0) cmd_code = 0x03;
+                        cJSON *root = cJSON_Parse(response_buffer);
+                        if (root != NULL) {
+                            cJSON *has_cmd = cJSON_GetObjectItem(root, "has_cmd");
+                            if (has_cmd && cJSON_IsTrue(has_cmd)) {
+                                cJSON *action = cJSON_GetObjectItem(root, "action");
+                                cJSON *os = cJSON_GetObjectItem(root, "os");
+                                
+                                if (action && action->valuestring) {
+                                    uint8_t cmd_code = 0;
+                                    if (strcmp(action->valuestring, "boot") == 0) cmd_code = 0x01;
+                                    else if (strcmp(action->valuestring, "reset") == 0) cmd_code = 0x02;
+                                    else if (strcmp(action->valuestring, "force_off") == 0) cmd_code = 0x03;
+                                    else if (strcmp(action->valuestring, "type_password") == 0) cmd_code = 0x04;
 
-                                if (cmd_code != 0) {
-                                    ESP_LOGI(TAG, "⚡ [Server Command] Executing %s for node %d", action->valuestring, i);
-                                    ble_trigger_pc_command(i, cmd_code);
+                                    if (cmd_code != 0) {
+                                        if (cmd_code <= 0x03) {
+                                            ble_trigger_pc_command(i, cmd_code);
+                                            ESP_LOGI(TAG, "✅ 已发送给蓝牙继电器");
+                                        }
 
-                                    if (i == 0 && cmd_code == 0x01 && os && os->valuestring) {
-                                        if (strcmp(os->valuestring, "win") == 0) {
-                                            ESP_LOGI(TAG, "⌨️ [Server Command] Triggering Windows GRUB Macro...");
-                                            trigger_windows_boot_macro();
+                                        if (i == 0) {
+                                            if (cmd_code == 0x01 && os && os->valuestring) {
+                                                if (strcmp(os->valuestring, "win") == 0) {
+                                                    trigger_windows_boot_macro();
+                                                }
+                                            }
+                                            if ((cmd_code == 0x01 || cmd_code == 0x02) && (strcmp(os->valuestring, "arch") == 0)){
+                                                is_call_from_remote = true;  //进arch的时候触发自动解锁锁屏
+                                            }
+                                            if (cmd_code == 0x04 && is_call_from_remote) {
+                                                ESP_LOGW(TAG, "🔑 呼叫 USB 键盘填充宏!");
+                                                is_call_from_remote = false;
+                                                trigger_password_macro();
+                                            }
                                         }
                                     }
                                 }
                             }
+                            cJSON_Delete(root);
                         }
-                        cJSON_Delete(root);
                     }
+                } else {
+                    g_server_connected = false;
                 }
-                // 3. 【发热优化】：用 close 代替 cleanup，仅关闭当前流，但保持 TLS Session 不死！
-                esp_http_client_close(client);
             } else {
                 g_server_connected = false;
                 ESP_LOGE(TAG, "HTTP Open failed: %s", esp_err_to_name(err));
             }
+            
+            // 【终极绝杀 3】：循环结束，骨灰扬了！彻底释放内存，准备下一次全新握手！
+            esp_http_client_cleanup(client);
         }
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
-    // 虽然是个死循环永远走不到这里，但语法上写上防止警告
-    esp_http_client_cleanup(client);
 }
 
 void app_main(void)
@@ -604,7 +683,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-
+            
     // =======================================
     // 原有的 LEDC 和 SPI 屏幕初始化代码 (保持不变)
     // =======================================
@@ -688,11 +767,11 @@ void app_main(void)
     
     // 【核心战略转移】：使用 1/2 屏幕 (86行)
     // 大约占用 55KB 内存。因为 LVGL 不抢地盘了，内部 SRAM 绝对装得下！
-    #define LINES_PER_FLUSH 86  
+    #define LINES_PER_FLUSH 140  
     size_t buffer_size = 320 * LINES_PER_FLUSH * sizeof(uint16_t);
     
     // 【终极魔法】：彻底抛弃 PSRAM，使用 MALLOC_CAP_INTERNAL！
-    uint16_t *buf1 = heap_caps_malloc(buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint16_t *buf1 = heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL);
     
     if (buf1 == NULL) {
         ESP_LOGE(TAG, "FATAL: Failed to allocate 55KB internal DMA memory!");

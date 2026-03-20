@@ -691,40 +691,13 @@ static void init_mesh_screen() {
     lv_obj_set_style_border_color(mesh_tv, lv_color_hex(0xad494a), LV_STATE_FOCUSED | LV_STATE_EDITED);
     lv_obj_add_event_cb(mesh_tv, mesh_tv_key_cb, LV_EVENT_KEY, NULL);
 
-    lv_obj_t * tile2 = lv_tileview_add_tile(mesh_tv, 0, 0, LV_DIR_HOR);
-    lv_obj_t * term_bg = lv_obj_create(tile2);
-    lv_obj_set_size(term_bg, 300, 90);
-    lv_obj_center(term_bg);
-    lv_obj_set_style_bg_color(term_bg, lv_color_hex(0x050505), 0);
-    lv_obj_set_style_border_color(term_bg, lv_color_hex(0x444444), 0);
-    
-    lv_obj_t * log_txt = lv_label_create(term_bg);
-    lv_label_set_text(log_txt, "[OK] Mesh Init\n[OK] TCP to Server\n[--] Waiting trigger...");
-    lv_obj_set_style_text_color(log_txt, lv_color_hex(0x00FF00), 0); 
-    lv_obj_align(log_txt, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    lv_obj_t * tile1 = lv_tileview_add_tile(mesh_tv, 1, 0, LV_DIR_HOR);
+    lv_obj_t * tile1 = lv_tileview_add_tile(mesh_tv, 0, 0, LV_DIR_HOR);
     lv_obj_t * node_card = lv_obj_create(tile1);
     lv_obj_set_size(node_card, 300, 90);
     lv_obj_center(node_card);
     lv_obj_set_style_bg_color(node_card, lv_color_hex(0x1C1C1C), 0);
     lv_obj_set_style_border_width(node_card, 0, 0);
-    
-    // lv_obj_t * node_title = lv_label_create(node_card);
-    // lv_label_set_text(node_title, LV_SYMBOL_BLUETOOTH " Node EFR32BG22");
-    // lv_obj_set_style_text_color(node_title, lv_color_hex(0x17A2B8), 0);
-    // lv_obj_align(node_title, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    // //lv_obj_t * bat_label = lv_label_create(node_card);
-    // lbl_batt[0] = lv_label_create(node_card);
-    // lv_label_set_text(lbl_batt[0], "Battery: --.-V"); // 默认占位符
-    // lv_obj_set_style_text_color(lbl_batt[0], lv_color_hex(0xFFFFFF), 0);
-    // lv_obj_align(lbl_batt[0], LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-    // lv_obj_t * state_label = lv_label_create(node_card);
-    // lv_label_set_text(state_label, "Link: Active");
-    // lv_obj_set_style_text_color(state_label, lv_color_hex(0x28A745), 0);
-    // lv_obj_align(state_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
 
     // ================= Node 0: mambo =================
     lbl_node_name[0] = lv_label_create(node_card);
@@ -751,6 +724,18 @@ static void init_mesh_screen() {
     lbl_conn_time[1] = lv_label_create(node_card);
     lv_label_set_text(lbl_conn_time[1], LV_SYMBOL_WIFI " --:--");
     lv_obj_align(lbl_conn_time[1], LV_ALIGN_TOP_LEFT, 210, 35);
+
+    lv_obj_t * tile2 = lv_tileview_add_tile(mesh_tv, 1, 0, LV_DIR_HOR);
+    lv_obj_t * term_bg = lv_obj_create(tile2);
+    lv_obj_set_size(term_bg, 300, 90);
+    lv_obj_center(term_bg);
+    lv_obj_set_style_bg_color(term_bg, lv_color_hex(0x050505), 0);
+    lv_obj_set_style_border_color(term_bg, lv_color_hex(0x444444), 0);
+    
+    lv_obj_t * log_txt = lv_label_create(term_bg);
+    lv_label_set_text(log_txt, "[OK] Mesh Init\n[OK] TCP to Server\n[--] Waiting trigger...");
+    lv_obj_set_style_text_color(log_txt, lv_color_hex(0x00FF00), 0); 
+    lv_obj_align(log_txt, LV_ALIGN_TOP_LEFT, 0, 0);
 }
 
 static void wifi_setup_cb(lv_event_t * e) {
