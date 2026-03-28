@@ -1,9 +1,14 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="icon" type="image/png" href="/apple-touch-icon.png">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Mesh 远程电源中枢</title>
+    <title>Mambo 开机助手</title>
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Mesh中枢">
     <style>
         :root {
             --bg-dark: #0f0f11;
@@ -62,36 +67,35 @@
         /* --- 控制面板区 --- */
         #main-ui { display: none; }
 
-        .header-title { font-size: 22px; font-weight: bold; margin-bottom: 20px; } /* 增加下方间距 */
+        .header-title { font-size: 22px; font-weight: bold; margin-bottom: 20px; }
 
-        /* --- 【核心修复】：扁平化水平状态栏指示牌区 --- */
+        /* --- 扁平化水平状态栏指示牌区 --- */
         .status-bar {
             display: flex;
-            justify-content: space-between; /* 极致等宽分配 */
+            justify-content: space-between;
             align-items: center;
-            gap: 8px; /* 短框之间的间距 */
-            margin-bottom: 30px; /* 状态栏下方的间距 */
-            padding: 0 5px; /* 两侧留白 */
+            gap: 8px;
+            margin-bottom: 30px;
+            padding: 0 5px;
         }
         .status-badge {
-            flex: 1; /* 每个徽章占据等长的空间 */
-            max-width: 32%; /* 极致防抖保护 */
-            padding: 8px 6px; /* 紧凑 padding */
-            border-radius: 12px; /* 扁平化圆角 */
-            font-size: 11px; /* 字体缩小以适应紧凑空间 */
+            flex: 1;
+            max-width: 32%;
+            padding: 8px 6px;
+            border-radius: 12px;
+            font-size: 11px;
             font-weight: 500;
             background-color: var(--disabled);
             color: var(--text-muted);
             transition: all 0.3s ease;
             display: flex;
-            justify-content: center; /* 内容水平居中 */
-            align-items: center; /* 内容垂直居中 */
-            gap: 3px; /* 图标与文字的极小间距 */
-            white-space: nowrap; /* 极致防抖：禁止换行 */
-            overflow: hidden; /* 极致防抖：隐藏溢出 */
-            text-overflow: ellipsis; /* 极致防抖：溢出显示省略号 */
+            justify-content: center;
+            align-items: center;
+            gap: 3px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        /* 在线状态：绿色文字 + 透明背景色 */
         .status-badge.on { background-color: rgba(46, 160, 67, 0.1); color: var(--success); }
 
 
@@ -116,6 +120,7 @@
             transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
         .toggle-btn.active { background: #3d3d42; color: white; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+        .toggle-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
         /* 中心大开机键 */
         .btn-boot {
@@ -174,13 +179,9 @@
             background-color: var(--danger);
             width: 0%;
             z-index: 1;
-            transition: width 0.05s linear; /* 提高进度条平滑度 */
+            transition: width 0.05s linear;
         }
         .btn-force-off span { position: relative; z-index: 2; pointer-events: none; }
-        .toggle-btn:disabled {
-            opacity: 0.4;
-            cursor: not-allowed;
-        }
     </style>
 </head>
 <body>
@@ -188,9 +189,9 @@
 <div class="container">
     <div id="login-screen">
         <div class="title">身份验证</div>
-        <input type="password" id="pass-input" placeholder="输入控制密码" inputmode="numeric" maxlength="6">
+        <input type="password" id="pass-input" placeholder="输入控制密码" inputmode="numeric">
         <br>
-        <button class="btn-action btn-enter" onclick="login()">进入系统</button>
+        <button class="btn-action btn-enter" id="btn-login" onclick="login()">进入系统</button>
     </div>
 
     <div id="main-ui">
@@ -199,12 +200,12 @@
         <div class="status-bar">
             <div class="status-badge" id="badge-mesh">📡 节点离线</div>
             <div class="status-badge" id="badge-batt">🔋 --.-V</div>
-            <div class="status-badge" id="badge-pc">🖥️ PC未知</div>
+            <div class="status-badge" id="badge-pc">🖥 PC未知</div>
         </div>
 
         <div class="toggle-group" id="os-selector">
-            <button class="toggle-btn" id="btn-os-arch" style="color:var(--accent-cyan);" onclick="setOS('arch')">Arch</button>
-            <button class="toggle-btn active" id="btn-os-win" style="color:var(--accent-blue);" onclick="setOS('win')">Windows</button>
+            <button class="toggle-btn active" id="btn-os-arch" style="color:var(--accent-cyan);" onclick="setOS('arch')">Arch</button>
+            <button class="toggle-btn" id="btn-os-win" style="color:var(--accent-blue);" onclick="setOS('win')">Windows</button>
         </div>
 
         <button class="btn-boot" id="btn-boot" onclick="sendCmd('boot')">开 机</button>
@@ -224,39 +225,61 @@
 <script>
     // ================= 全局状态 =================
     let state = {
+        token: '',       // 存储后端发来的通行证
         role: '',        // 'mambo' 或 'kang'
-        os: 'win',       // 默认系统
-        meshOnline: false, // Mesh 节点是否在线
-        meshBatt: 0.0,     // Mesh 节点电压
-        pcIsOn: false      // PC 物理电源状态
+        os: 'arch',       // 默认系统
+        meshOnline: false,
+        meshBatt: 0.0,
+        pcIsOn: false
     };
 
-    // 假设这里的密码逻辑后续会移交到 Node.js 后端
-    const USERS = {
-        '111111': { role: 'mambo', name: "Mambo 的主机" },
-        '888888': { role: 'kang',  name: "Kang 的主机" }
-    };
+    let pollingTimer = null; // 状态轮询定时器
 
-    // ================= 1. 登录与权限渲染 =================
-    function login() {
+    // ================= 1. 真实网络登录逻辑 =================
+    async function login() {
         const pass = document.getElementById('pass-input').value;
-        const user = USERS[pass];
+        const btnLogin = document.querySelector('.btn-enter');
 
-        if(user) {
-            state.role = user.role;
-            document.getElementById('login-screen').style.display = 'none';
-            document.getElementById('main-ui').style.display = 'block';
-            document.getElementById('pc-name').innerText = user.name;
+        if (!pass) return alert('请输入密码！');
 
-            // 【权限隔离】：如果是 kang，直接把 GRUB 系统选择器隐藏掉 (极致简洁)
-            const osSelector = document.getElementById('os-selector');
-            if(state.role === 'kang') {
-                osSelector.style.display = 'none';
+        btnLogin.innerText = '验证中...';
+        btnLogin.disabled = true;
+
+        try {
+            // 向 Node.js 后端发送真实的登录请求
+            const response = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pin: pass })
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+                state.token = result.token;
+                state.role = result.role;
+
+                document.getElementById('login-screen').style.display = 'none';
+                document.getElementById('main-ui').style.display = 'block';
+                document.getElementById('pc-name').innerText = result.msg;
+
+                const osSelector = document.getElementById('os-selector');
+                if(state.role === 'kang') {
+                    osSelector.style.display = 'none';
+                }
+
+                // 登录成功后，立刻拉取一次真实状态，并开启每 3 秒一次的自动轮询
+                fetchStatus();
+                pollingTimer = setInterval(fetchStatus, 3000);
+
+            } else {
+                alert(result.msg || '密码错误！');
             }
-
-            fetchStatus(); // 拉取设备状态
-        } else {
-            alert('密码错误！(测试密码: 111111 或 888888)');
+        } catch (error) {
+            alert('网络连接失败，请检查后端服务是否正常运行。');
+        } finally {
+            btnLogin.innerText = '进入系统';
+            btnLogin.disabled = false;
         }
     }
 
@@ -279,7 +302,6 @@
         const btnReset = document.getElementById('btn-reset');
         const btnForce = document.getElementById('btn-force');
 
-        // 【新增】：获取操作系统按钮
         const btnOsArch = document.getElementById('btn-os-arch');
         const btnOsWin = document.getElementById('btn-os-win');
 
@@ -292,53 +314,61 @@
             else badgeBatt.classList.remove('on');
 
             if(state.pcIsOn) {
-                badgePc.innerText = '🖥️ 运行中';
+                badgePc.innerText = '🖥 运行中';
                 badgePc.classList.add('on');
 
                 btnBoot.disabled = true;  btnBoot.innerText = '已运行';
                 btnReset.disabled = false; btnForce.disabled = false;
 
-                // 【新增】：电脑开机后，彻底禁用系统切换按钮
                 btnOsArch.disabled = true;
                 btnOsWin.disabled = true;
             } else {
-                badgePc.innerText = '🖥️ 已关机';
+                badgePc.innerText = '🖥 已关机';
                 badgePc.classList.remove('on');
 
                 btnBoot.disabled = false; btnBoot.innerText = '开 机';
                 btnReset.disabled = true;  btnForce.disabled = true;
 
-                // 【新增】：电脑关机时，解锁系统切换
                 btnOsArch.disabled = false;
                 btnOsWin.disabled = false;
             }
         } else {
+            // 节点离线，全局锁死
             badgeMesh.innerText = '📡 离线';   badgeMesh.classList.remove('on');
             badgeBatt.innerText = '🔋 --.-V';  badgeBatt.classList.remove('on');
-            badgePc.innerText = '🖥️ 未知';     badgePc.classList.remove('on');
+            badgePc.innerText = '🖥 未知';     badgePc.classList.remove('on');
 
             btnBoot.disabled = true;  btnBoot.innerText = '脱 机';
             btnReset.disabled = true;
             btnForce.disabled = true;
 
-            // 【新增】：如果连 Mesh 节点都断线了，同样锁死系统切换
             btnOsArch.disabled = true;
             btnOsWin.disabled = true;
         }
     }
 
-    // ================= 4. 发送网络指令 =================
-    function sendCmd(cmd) {
-        if(!state.meshOnline) return; // 二重防护
-        console.log(`执行下发 -> 目标: ${state.role}, 动作: ${cmd}, 系统: ${state.os}`);
+    // ================= 4. 发送真实的控制指令 =================
+    async function sendCmd(cmd) {
+        if(!state.meshOnline) return;
 
-        if(cmd === 'boot') {
-            document.getElementById('badge-pc').innerText = '⏳ 唤醒中...';
-            // 模拟 2 秒后节点听到了开机成功的广播
-            setTimeout(() => { state.pcIsOn = true; updateUI(); }, 2000);
-        } else if (cmd === 'force_off' || cmd === 'reset') {
-            document.getElementById('badge-pc').innerText = '⏳ 执行中...';
-            setTimeout(() => { state.pcIsOn = false; updateUI(); }, 2000);
+        // 【按照你的要求：删除所有前端的“唤醒中/执行中”假动画】
+        // 直接向 Node.js 服务器静默下发指令
+        try {
+            await fetch('/api/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    token: state.token,
+                    target: state.role,
+                    action: cmd,
+                    os: state.os
+                })
+            });
+            // 重点：发完指令什么都不干！
+            // 安静等待每 3 秒一次的 fetchStatus() 把 ESP32 的真实物理开机状态拉回来！
+        } catch(e) {
+            console.error('发送指令失败:', e);
+            alert('网络异常，指令下发失败！');
         }
     }
 
@@ -350,8 +380,6 @@
 
     function startHold(e) {
         if(e) e.preventDefault();
-
-        // 【核心修复】：原先是 state.isOn，现在必须用 state.pcIsOn 才能正确判断！
         if(!state.pcIsOn) return;
 
         const progressBar = document.getElementById('force-progress');
@@ -377,14 +405,27 @@
         document.getElementById('force-progress').style.width = '0%';
     }
 
-    // ================= 6. 模拟向服务器拉取状态 =================
-    function fetchStatus() {
-        // 演示：登录进来假设节点在线，电压 3.15V，电脑关机
-        state.meshOnline = true;
-        state.meshBatt = 3.15;
-        state.pcIsOn = false;
+    // ================= 6. 真实向服务器拉取状态 =================
+    async function fetchStatus() {
+        if(!state.token) return; // 没登录不拉取
 
-        // 你可以把 state.meshOnline 改成 false 测一下“全盘锁死”的脱机状态
+        try {
+            // 向 Node.js 拉取自己所属节点的真实状态
+            const response = await fetch(`/api/status?token=${state.token}&target=${state.role}`);
+            const data = await response.json();
+
+            if(data.success) {
+                // 将后端发来的真实数据覆盖到前端状态机
+                state.meshOnline = data.meshOnline;
+                state.meshBatt = data.meshBatt;
+                state.pcIsOn = data.pcIsOn;
+            } else {
+                state.meshOnline = false;
+            }
+        } catch(e) {
+            state.meshOnline = false;
+        }
+
         updateUI();
     }
 </script>

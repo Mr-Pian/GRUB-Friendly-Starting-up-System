@@ -85,6 +85,9 @@ static void radar_timer_cb(void* arg) {
 static int on_write_complete_cb(uint16_t conn_handle, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg) {
     bool success = (error->status == 0);
     if (g_cmd_result_cb) g_cmd_result_cb(pending_target, pending_cmd, success);
+    if (success) {
+        cmd_retry_count = 0;
+    }
     ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     return 0;
 }
