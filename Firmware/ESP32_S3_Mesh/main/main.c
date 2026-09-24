@@ -343,14 +343,14 @@ static void type_password_task(void *arg) {
     } key_stroke_t;
 
     key_stroke_t password[] = {
-        {KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_P}, // 大写 P
-        {0, HID_KEY_A},                           // 小写 a
-        {0, HID_KEY_S},                           // 小写 s
-        {0, HID_KEY_S},                           // 小写 s
-        {0, HID_KEY_1},                           // 数字 1
-        {0, HID_KEY_8},                           // 数字 8
-        {0, HID_KEY_1},                           // 数字 1
-        {0, HID_KEY_8}                            // 数字 8
+        {0, HID_KEY_P},                           // p
+        {0, HID_KEY_A},                           // a
+        {0, HID_KEY_S},                           // s
+        {0, HID_KEY_S},                           // s
+        {0, HID_KEY_W},                           // w
+        {0, HID_KEY_O},                           // o
+        {0, HID_KEY_R},                           // r
+        {0, HID_KEY_D}                            // d
     };
     
     // 3. 循环击键
